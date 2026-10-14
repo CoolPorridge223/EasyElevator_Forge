@@ -46,7 +46,7 @@ tasks.register('packageProject', Zip) {
     destinationDirectory = layout.buildDirectory.dir('distributions')
     into('EasyElevator_Forge') {
         from(projectDir) {
-            include 'src/**', 'gradle/wrapper/**', 'tools/build.ps1'
+            include 'src/**', 'gradle/wrapper/**'
             include 'gradlew', 'gradlew.bat', 'build.gradle', 'settings.gradle', 'gradle.properties'
             include '.gitignore', 'README.md', '开发手册.md', 'LICENSE.txt', 'deveolpment_stadard.txt'
         }
