@@ -1,0 +1,280 @@
+package org.DJB.easyelevator.block;
+
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.nbt.CompoundTag;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.Level;
+import org.DJB.easyelevator.Easyelevator;
+import org.DJB.easyelevator.entity.AbstractCabinEntity;
+import org.DJB.easyelevator.logic.DoorArrivalSound;
+import org.DJB.easyelevator.logic.DoorSounds;
+import org.DJB.easyelevator.logic.ElevatorLine;
+import org.DJB.easyelevator.logic.ElevatorParameters;
+import org.DJB.easyelevator.logic.ElevatorStatus;
+
+/**
+ * 楼层门根方块的方块实体：只为"门扇滑动"提供连续、可插值的进度样本。
+ *
+ * <p>为什么需要它：{@link LandingDoorBlock#OPEN} 是离散的布尔方块状态，只能表达"关/开"，
+ * 而方块状态驱动的方块模型在渲染时无法插值，于是门面只能在两套模型之间瞬间切换（原来看起来
+ * 就是"一下子变成一堵墙"）。连续进度放在方块实体里，再交给
+ * {@link org.DJB.easyelevator.client.LandingDoorRenderer} 逐帧插值绘制，才可能做到与轿厢门
+ * 同样的平滑滑动。
+ *
+ * <p>进度来源：直接取在站轿厢的门进度（{@link LandingDoorBlock#leafProgress}），
+ * 所以楼层门的两扇门扇与轿厢门（两扇对开滑门）同刻同值、同速同向，开关门完全同步；
+ * 没有轿厢精确停靠在本层时恒为 0（门扇全关，门洞被完全封住）。
+ *
+ * <p>为什么不发同步包：进度是"已同步的轿厢门进度 + 已同步的 OPEN 方块状态"的纯函数，
+ * 客户端与服务端各自就地算出的结果必然一致，因此不需要任何自定义包，也不写世界状态。
+ *
+ * <p>采样按刻对齐：{@link #sample()} 用世界刻号当闸门，一刻只推进一次样本。同一刻内无论
+     * 面板是否刷新、渲染跑多少帧，都共享同一对渲染样本（上一刻/当前刻），碰撞独立读取最新进度；
+ * 渲染器再用 a 在两者之间线性插值——这与轿厢渲染器读 SynchedEntityData 的上一刻/当前值
+ * 完全同构，因此两层门在画面上不会互相错位。
+ */
+public final class LandingDoorBlockEntity extends BlockEntity {
+    /** 当前刻的门扇进度：0 = 完全关闭（门扇封住门洞），1 = 完全打开（门扇收进两侧门框）。 */
+    private float progress;
+    /** 上一刻的门扇进度，供渲染插值使用。 */
+    private float previousProgress;
+    /** 上一次采样时的世界刻号；{@code Long.MIN_VALUE} 表示这一对样本还没被推进过。 */
+    private long sampledTick = Long.MIN_VALUE;
+
+    /**
+     * 本门是否被指定为这条线路的<b>基准层</b>（潜行右键门上任意部件设置，见 {@code LandingDoorBlock#use}）。
+     *
+     * <p>基准层就是"1 层"：它上方的站点依次显示 2、3…，下方的依次显示 B1、B2…（见 {@code logic/FloorIndicator}）。
+     * 一条线路最多一扇门带这个标记；标记写在方块实体里，因此随区块一起存档、拆掉门就自然失效
+     * （整条线路回到默认编号：最低站点 = 1 层）。</p>
+     */
+    private boolean baseFloor;
+
+    /** 本线路轿厢的当前楼层号（1 起，0 = 没有轿厢）：门框顶部的红色层号显示用，同样每刻只查一次。 */
+    private int cabinFloor;
+
+    /** 本线路轿厢的运行状态（上行/下行/停靠）：与 {@link #cabinFloor} 一起构成门框顶部的显示内容。 */
+    private ElevatorStatus cabinStatus = ElevatorStatus.IDLE;
+
+    /** 本线路轿厢是不是观光型号（玻璃舱壁）：决定这扇门的门扇是钢门还是"铁框 + 玻璃"门。 */
+    private boolean glassDoors;
+
+    /**
+     * <b>本扇门自己的</b>到站提示音设置（开关 + 音效选项），由潜行右键打开的专属设置面板修改。
+     *
+     * <p>为什么放在方块实体里而不是做一个全局配置：需求就是"每扇门各不相同"——同一栋楼里
+     * 大堂那扇门到站时想响一声铃、设备层想安静。方块实体随区块存档，拆掉门设置自然失效，
+     * 也不会在别的线路上串味。</p>
+     *
+     * <p>默认是 {@link DoorArrivalSound#DEFAULT}（<b>发声</b> + 默认音效），等于模组原有的
+     * "到站必响一次"，因此新放置的门到站就会响。旧存档里没有这两个字段，{@link DoorArrivalSound#loadAllItems}
+     * 对缺失的开关回退到出厂默认（发声），所以已经存在的门升级后照旧会响、不需要逐扇重设。
+     * 轿厢精确到站时由 {@code AbstractCabinEntity} 读取本设置决定播什么。</p>
+     */
+    private DoorArrivalSound arrivalSound = DoorArrivalSound.DEFAULT;
+
+    /**
+     * @param worldPosition 根方块坐标（整扇门只有这一个部件持有方块实体）
+     * @param state 根方块状态
+     */
+    public LandingDoorBlockEntity(BlockPos worldPosition, BlockState state) { super(Easyelevator.LANDING_DOOR_BE.get(),worldPosition,state); }
+
+    /**
+     * Forge 的方块实体视锥剔除入口：按整扇 3×3 门体判断可见性。
+     * 门框由区块模型绘制，门扇与数字则都由底部根实体绘制；若只取根格碰撞盒，
+     * 近距离抬头或侧看时会把仍在视野中的门扇和数字一起剔除。
+     * shouldRenderOffScreen 不能绕过 Forge 的这次检查，必须显式返回世界坐标边界。
+     * @return 覆盖所有动态门部件的固定有限包围盒；不改变方块碰撞或门动画
+     */
+    @Override
+    public AABB getRenderBoundingBox() {
+        BlockState state=getBlockState();
+        if(!state.hasProperty(LandingDoorBlock.FACING)) return new AABB(worldPosition);
+        return LandingDoorGeometry.renderBounds(state.getValue(LandingDoorBlock.FACING)).move(worldPosition);
+    }
+
+    /** 不做插值的门扇进度，用于碰撞形状与联锁判定。
+     * @return 当前刻进度 0..1（0 全关、1 全开） */
+    public float currentPeekAmount() {
+        if (level == null) return 0f;
+        BlockState state = level.getBlockState(worldPosition);
+        // 碰撞必须读最新进度；本刻早些时候的渲染采样可能早于轿厢 tick 或客户端状态包。
+        return state.is(Easyelevator.LANDING_DOOR.get()) && state.getValue(LandingDoorBlock.OPEN)
+                ? LandingDoorBlock.leafProgress(level, worldPosition) : 0f;
+    }
+
+    /** 渲染用的插值进度：与轿厢门用同一个 a 在上一刻/当前刻样本之间插值。
+     * @param a 渲染插值系数，0..1，由渲染管线给出
+     * @return 插值后的进度 0..1 */
+    public float currentPeekAmount(float a) {
+        sample();
+        return Mth.lerp(Mth.clamp(a,0,1),previousProgress,progress);
+    }
+
+    /**
+     * 按世界刻推进一次样本；同一刻重复调用直接返回，保证插值窗口恰好是一刻。
+     *
+     * <p>用 {@code level.getBlockState(worldPosition)} 而不是 {@link #getCachedState()}：方块状态随时
+     * 可能被 {@link LandingDoorBlock#refresh} 改写，这里每刻只读一次，取最新值最稳妥。
+     *
+     * <p>副作用：更新 progress/previousProgress/cabinFloor/cabinStatus/sampledTick；只读世界，不写世界。
+     */
+    private void sample() {
+        if (level==null) return; // 还没有加入世界（构造或加载过程中）：保持 0，避免空指针
+        long now=level.getGameTime();
+        if (now==sampledTick) return;
+        BlockState state=level.getBlockState(worldPosition);
+        previousProgress=progress;
+        // OPEN 为假说明联锁不成立（没有轿厢精确到站），此时门扇必定全关，不必再去查世界。
+        progress=state.is(Easyelevator.LANDING_DOOR.get()) && state.getValue(LandingDoorBlock.OPEN)
+                ? LandingDoorBlock.leafProgress(level,worldPosition) : 0f;
+        // 门框顶部的显示内容（楼层号 + 运行状态）同样每刻只查一次，渲染器直接读缓存
+        AbstractCabinEntity cabin=state.is(Easyelevator.LANDING_DOOR.get()) ? cabinOf(level,state) : null;
+        cabinFloor=cabin==null ? 0 : cabin.floorNumber();
+        cabinStatus=cabin==null ? ElevatorStatus.IDLE : cabin.status();
+        // 观光线路上的门扇也跟着变成玻璃门（整条线路统一：门是哪一扇由线路上的轿厢决定，
+        // 这样一条轨道上的所有楼层门看起来才一致；没有轿厢时退回钢门）
+        glassDoors=cabin!=null && cabin.glassWalls();
+        sampledTick=now;
+    }
+
+    /**
+     * 本线路上的轿厢（没有则返回 null），供门框顶部的"运行状态 + 楼层号"显示使用。
+     *
+     * <p>为什么按车体世界坐标匹配、而不是 {@code railX()} / {@code railZ()}：那两个字段没有进
+     * SynchedEntityData，客户端上恒为 0；用它匹配会让客户端永远找不到轿厢（"轿厢门开了、楼层门不动"
+     * 就是同一个原因）。这里用线路中心 + 高度区间定位车体，服务端与客户端都能算出一致结果。
+     *
+     * <p>只读查询：每刻由 {@link #sample()} 调用一次并缓存，渲染器直接读 {@link #cabinFloor()} 与
+     * {@link #cabinStatus()}。
+     *
+     * @param level 世界
+     * @param state 根方块状态（用其 FACING 反推轨道位置）
+     * @return 本线路的轿厢；线路无效或没有轿厢时为 null
+     */
+    private AbstractCabinEntity cabinOf(Level level,BlockState state) {
+        ElevatorLine line=ElevatorLine.scan(level,LandingDoorBlock.railPos(state,worldPosition));
+        if(line==null) return null;
+        double x=line.centerX(), z=line.centerZ();
+        AbstractCabinEntity found=null;
+        for(AbstractCabinEntity cabin:level.getEntitiesOfClass(AbstractCabinEntity.class,
+                new AABB(x-1.6,line.bottom()-1,z-1.6,x+1.6,line.top()+4,z+1.6),
+                c->!c.isRemoved() && Math.abs(c.getX()-x)<=ElevatorParameters.SYNC_POSITION_EPSILON
+                        && Math.abs(c.getZ()-z)<=ElevatorParameters.SYNC_POSITION_EPSILON)) {
+            // 一条线路上正常情况下只有一辆轿厢；万一世界里存在多辆（测试世界很常见），
+            // 固定取实体 id 最小的那辆，保证门框显示稳定，不会在两辆车之间来回跳。
+            if(found==null || cabin.getId()<found.getId()) found=cabin;
+        }
+        return found;
+    }
+
+    /**
+     * @return 本线路轿厢的当前楼层号（1 起；0 = 没有轿厢），渲染门框顶部显示时使用；每刻更新一次
+     */
+    public int cabinFloor() { sample(); return cabinFloor; }
+
+    /**
+     * @return 本线路轿厢的运行状态（上行/下行/停靠），渲染门框顶部显示时使用；每刻更新一次
+     */
+    public ElevatorStatus cabinStatus() { sample(); return cabinStatus; }
+
+    /**
+     * 本线路的门扇是否应该画成"铁框 + 玻璃"（观光轿厢的线路）。
+     *
+     * <p>判据是线路上那辆轿厢的 {@code glassWalls()}：一条轨道上的所有楼层门共用同一个结论，
+     * 因此观光轿厢所在线路的每一层都是玻璃门，其它线路照旧是钢门。没有轿厢时返回 false（钢门）。
+     * 与楼层号/运行状态一样每刻只查一次并缓存，客户端就地算得出一致结果，不需要同步包。
+     *
+     * @return 门扇用玻璃门时 true
+     */
+    public boolean glassDoors() { sample(); return glassDoors; }
+
+    /**
+     * @return 本门是否为这条线路的基准层（1 层）；编号计算全在服务端完成，因此这个值只在服务端有意义
+     */
+    public boolean baseFloor() { return baseFloor; }
+
+    /**
+     * 设置 / 清除基准层标记。
+     *
+     * @param value true = 本门成为整条线路的 1 层
+     * 副作用：改动方块实体 NBT 并 setChanged()，随区块保存；不改方块状态、不发包。
+     */
+    public void setBaseFloor(boolean value) {
+        if (baseFloor == value) return;
+        baseFloor = value;
+        setChanged();
+    }
+
+    /**
+     * @return 本扇门自己的到站音效设置；端无关（服务端存档与播放读它，客户端面板由包里带来的快照驱动）
+     */
+    public DoorArrivalSound arrivalSound() { return arrivalSound; }
+
+    /**
+     * 覆盖本扇门的到站音效设置。
+     *
+     * <p>相等的值直接返回，避免面板连点同一个开关时反复 setChanged（区块因此被标脏、频繁存盘）。
+     *
+     * @param settings 新设置；传入 null 视为恢复出厂默认（{@link DoorArrivalSound#DEFAULT}）
+     * 副作用：改动方块实体 NBT 并 setChanged()，随区块保存；不改方块状态、不发包。
+     */
+    public void setArrivalSound(DoorArrivalSound settings) {
+        DoorArrivalSound next = settings == null ? DoorArrivalSound.DEFAULT : settings;
+        if (arrivalSound.equals(next)) return;
+        arrivalSound = next;
+        setChanged();
+    }
+
+    /**
+     * 本扇门在运行时资源包里占用的<b>音效槽位</b>号（见 {@code client/DoorSoundPack}）。
+     *
+     * <p>算法与理由都在 {@link DoorSounds#slotFor}：由坐标纯函数推导，因此"只要门还在原地，
+     * 槽位就永远不变"，拆了再放回来也还是同一个槽位，服务端与客户端算出的结果天然一致，
+     * 不需要同步也不需要持久化。代价是不同门可能撞到同一个槽位（最多 64 个），
+     * 那种情况下两扇门响同一个音效——对"提示音"这种装修属性来说是可接受的退化。
+     *
+     * @return {@code [0, DoorSounds.MAX_SLOTS)} 内的槽位号；同一扇门恒定不变
+     */
+    public int soundSlot() { return DoorSounds.slotFor(worldPosition.getX(), worldPosition.getY(), worldPosition.getZ()); }
+
+    /**
+     * 本扇门到站时实际要播放的音效。
+     *
+     * <p>把"设置 + 槽位"这两件只有方块实体知道的事合起来解释成音效事件，调用方
+     * （{@code AbstractCabinEntity}）就只需要问一次，不必自己拼装槽位与选项。
+     *
+     * @return 该门到站要播的音效；开关关着时返回 null（调用方据此跳过播放）
+     */
+    public net.minecraft.sounds.SoundEvent arrivalEvent() {
+        return arrivalSound.enabled() ? DoorSounds.arrivalEvent(arrivalSound.choice(), soundSlot()) : null;
+    }
+
+    /**
+     * 把基准层标记与到站音效设置写进方块实体 NBT（随区块存档）。
+     *
+     * @param nbt 目标 NBT
+     * @param registries 注册表查询（本实体没有需要迁移的字段，仅透传给父类）
+     */
+    @Override protected void saveAdditional(CompoundTag nbt) {
+        super.saveAdditional(nbt);
+        if (baseFloor) nbt.putBoolean("BaseFloor",true); // 只写 true：默认门不必多一个 false 字段
+        arrivalSound.writeNbt(nbt); // 同理：整份默认设置不写任何字段，旧存档体积不变
+    }
+
+    /**
+     * 从方块实体 NBT 读回基准层标记与到站音效设置。
+     *
+     * @param nbt 存档 NBT
+     * @param registries 注册表查询（透传父类）
+     */
+    @Override public void load(CompoundTag nbt) {
+        super.load(nbt);
+        baseFloor=nbt.getBoolean("BaseFloor");
+        arrivalSound=DoorArrivalSound.loadAllItems(nbt); // 开关字段缺失 = 出厂默认（发声）：旧存档的门升级后照旧会响；只有玩家真的关掉才写 false
+    }
+}

@@ -1,0 +1,21 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="All Rights Reserved"
+[[mods]]
+modId="easyelevator"
+version="${version}"
+displayName="EasyElevator"
+authors="DJB"
+description="Four elevator variants with floor dispatch, cargo and custom arrival sounds."
+[[dependencies.easyelevator]]
+modId="forge"
+mandatory=true
+versionRange="[47.4.26,48)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.easyelevator]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1]"
+ordering="NONE"
+side="BOTH"

@@ -1,0 +1,54 @@
+plugins {
+    id 'net.minecraftforge.gradle' version '6.0.54'
+    id 'org.spongepowered.mixin' version '0.7-SNAPSHOT'
+}
+version = mod_version
+group = 'org.DJB'
+base { archivesName = 'easyelevator' }
+java { toolchain.languageVersion = JavaLanguageVersion.of(17); withSourcesJar() }
+minecraft {
+    mappings channel: 'official', version: minecraft_version
+    copyIdeResources = true
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods { easyelevator { source sourceSets.main } }
+        }
+        client { }
+        server { args '--nogui' }
+    }
+}
+mixin { add sourceSets.main, 'easyelevator.refmap.json'; config 'easyelevator.mixins.json'; config 'easyelevator.client.mixins.json' }
+repositories { maven { url = 'https://repo.spongepowered.org/repository/maven-public/'; content { includeGroup 'org.spongepowered' } } }
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+}
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8'; options.release = 17; options.compilerArgs += ['-Xmaxerrs', '1000'] }
+processResources { inputs.property 'version', project.version; filesMatching('META-INF/mods.toml') { expand version: project.version } }
+jar { manifest { attributes 'MixinConfigs': 'easyelevator.mixins.json,easyelevator.client.mixins.json' }; finalizedBy 'reobfJar' }
+tasks.withType(AbstractArchiveTask).configureEach { preserveFileTimestamps = false; reproducibleFileOrder = true }
+
+
+// 验收后的工程不保留临时测试任务。生产包经过 reobfJar 后才归档。
+tasks.named('test') { enabled = false }
+tasks.named('testClasses') { enabled = false }
+tasks.register('packageRelease', Zip) {
+    dependsOn 'build', 'reobfJar'
+    archiveFileName = "easyelevator-${project.version}-release.zip"
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    from(tasks.named('jar')) { into 'mods' }
+    from('README.md', '开发手册.md', 'LICENSE.txt')
+}
+tasks.register('packageProject', Zip) {
+    archiveFileName = "easyelevator-${project.version}-project.zip"
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    into('EasyElevator_Forge') {
+        from(projectDir) {
+            include 'src/**', 'gradle/wrapper/**', 'tools/build.ps1'
+            include 'gradlew', 'gradlew.bat', 'build.gradle', 'settings.gradle', 'gradle.properties'
+            include '.gitignore', 'README.md', '开发手册.md', 'LICENSE.txt', 'deveolpment_stadard.txt'
+        }
+    }
+}
